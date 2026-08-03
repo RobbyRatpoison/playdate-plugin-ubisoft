@@ -1,0 +1,25 @@
+{
+    "id": "ubisoft",
+    "name": "Ubisoft Connect",
+    "version": "1.0.0",
+    "platform": "ubisoft",
+    "author": "RobbyRatpoison",
+    "source": "github:RobbyRatpoison/playdate-plugin-ubisoft",
+    "launcher": {
+        "required": true,
+        "name": "Ubisoft Connect",
+        "exe_name": "UbisoftConnect.exe",
+        "installer": {
+            "url": "https://ubistatic3-a.akamaihd.net/orbit/launcher_installer/UbisoftConnectInstaller.exe",
+            "type": "exe",
+            "winearch": "win64",
+            "win_version": "win10",
+            "install_path": "Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher"
+        }
+    },
+    "platform_status": {
+        "windows": "untested",
+        "linux": "broken",
+        "mac": "untested"
+    }
+}
