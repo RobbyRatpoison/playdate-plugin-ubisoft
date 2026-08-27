@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import time
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,79 @@ def _find_wine_launcher_config():
     return None, None, None
 
 
+# Marker path segment for an actual installed game's executable -- Ubisoft
+# Connect installs every game under its own managed 'games' subfolder (see
+# watcher._UBI_GAMES_SUBPATH). Checking for this is far more robust than an
+# exclusion list of known launcher/Wine-infra process names, which broke on
+# the very first cold start: unrelated pressure-vessel container helper
+# processes (srt-bwrap, pv-adverb) also carry this prefix's WINEPREFIX env
+# and aren't part of any such list, so they were misclassified as a running
+# game and blocked launch_game() from ever starting anything.
+_GAME_PATH_MARKER = '/ubisoft game launcher/games/'
+
+
+def _game_is_running(prefix):
+    """Confirmed live against a real running game (Child of Light):
+    matches C:/.../Ubisoft Game Launcher/games/Child of Light Demo/ChildofLight.exe.
+    Known gap: a game takes a few seconds to spawn its own exe after its
+    uplay://launch/ deep link fires, so a click landing in that narrow window
+    won't be caught -- accepted as a rare edge case rather than papered over
+    with a fixed grace-period timeout."""
+    from runners.wine import list_prefix_processes
+    for _pid, argv0 in list_prefix_processes(prefix):
+        if _GAME_PATH_MARKER in argv0.replace('\\', '/').lower():
+            return True
+    return False
+
+
+def _send_uplay_url(url):
+    """Dispatch a uplay:// deep link (install/launch/uninstall all funnel
+    through this) on the current platform. Returns an error dict on
+    failure, or None on success -- shared so launch_game() and
+    uninstall_game() get identical Wine-session/already-running-game
+    handling instead of duplicating it."""
+    try:
+        if sys.platform == 'win32':
+            os.startfile(url)
+        elif sys.platform == 'darwin':
+            import subprocess
+            subprocess.Popen(['open', url])
+        else:  # Linux — Wine
+            import json
+            from config import CONFIG_PATH
+            try:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+            launcher_cfg = cfg.get('launchers', {}).get('ubisoft', {})
+            prefix   = launcher_cfg.get('prefix', '').strip()
+            wine_bin = launcher_cfg.get('wine_bin', '').strip() or None
+
+            if not prefix:
+                return {
+                    'status':  'error',
+                    'message': 'Ubisoft Connect not configured. Open Plugins → Manage to set up Wine.',
+                }
+            if _game_is_running(prefix):
+                return {
+                    'status':  'error',
+                    'message': 'A Ubisoft game is currently running — close it before launching, '
+                               'installing, or uninstalling a different game.',
+                }
+            from runners.wine import launch_protocol_url
+            # Ubisoft Connect's Chromium UI won't accept a uplay:// deep link
+            # into an already-running instance under Wine -- the session has to
+            # be ended and cold-started (it re-forwards the link on startup).
+            launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={'WINEDEBUG': '-all'},
+                                restart_session_if_running=True)
+    except RuntimeError as e:
+        return {'status': 'error', 'message': str(e)}
+    except Exception as e:
+        return {'status': 'error', 'message': f'Launch failed: {e}'}
+    return None
+
+
 class UbisoftPlugin:
     id       = 'ubisoft'
     name     = 'Ubisoft Connect'
@@ -64,21 +138,23 @@ class UbisoftPlugin:
         log.info('Ubisoft Connect plugin registered')
 
     def on_startup(self):
-        from .watcher import sync_ubisoft_install_status, start_periodic_sync
+        from .watcher import sync_ubisoft_install_status, start_ubisoft_watcher, _get_wine_install_base
         try:
             sync_ubisoft_install_status()
             log.info('Ubisoft install status synced on startup')
         except Exception as e:
             log.warning(f'Startup Ubisoft install sync failed: {e}')
-        start_periodic_sync()
+        if sys.platform != 'win32':
+            install_base = _get_wine_install_base()
+            if install_base:
+                start_ubisoft_watcher(install_base)
 
     def resync_installed(self):
         from .watcher import sync_ubisoft_install_status
         sync_ubisoft_install_status()
 
     def on_shutdown(self):
-        from .watcher import stop_periodic_sync, stop_ubisoft_watcher
-        stop_periodic_sync()
+        from .watcher import stop_ubisoft_watcher
         stop_ubisoft_watcher()
 
     def on_uninstall(self):
@@ -86,7 +162,6 @@ class UbisoftPlugin:
         clear_ubi_tokens()
 
     def launch_game(self, appid):
-        import time
         from database import get_db, ts_to_date, update_game_data
 
         db  = get_db()
@@ -102,46 +177,51 @@ class UbisoftPlugin:
         if not space_id:
             return {'status': 'error', 'message': 'Game has no space ID — try re-syncing'}
 
+        from .watcher import resolve_launch_id
+        launch_id = resolve_launch_id(space_id)
+        if not launch_id:
+            log.warning(f'Ubisoft launch: no local launch id for spaceId {space_id}, '
+                        f'falling back to spaceId (deep link will likely be ignored by the client)')
+            launch_id = space_id
+
         if row['installed']:
-            url = f'uplay://launch/{space_id}/0'
+            url = f'uplay://launch/{launch_id}/0'
         else:
-            url = f'uplay://install/{space_id}'
+            url = f'uplay://install/{launch_id}'
 
-        try:
-            if sys.platform == 'win32':
-                os.startfile(url)
-            elif sys.platform == 'darwin':
-                import subprocess
-                subprocess.Popen(['open', url])
-            else:  # Linux — Wine
-                import json
-                from config import CONFIG_PATH
-                try:
-                    with open(CONFIG_PATH, 'r') as f:
-                        cfg = json.load(f)
-                except Exception:
-                    cfg = {}
-                launcher_cfg = cfg.get('launchers', {}).get('ubisoft', {})
-                prefix   = launcher_cfg.get('prefix', '').strip()
-                wine_bin = launcher_cfg.get('wine_bin', '').strip() or None
-
-                if not prefix:
-                    return {
-                        'status':  'error',
-                        'message': 'Ubisoft Connect not configured. Open Plugins → Manage to set up Wine.',
-                    }
-                from runners.wine import launch_protocol_url
-                launch_protocol_url(prefix, url, wine_bin=wine_bin, env_extra={'WINEDEBUG': '-all'})
-        except RuntimeError as e:
-            return {'status': 'error', 'message': str(e)}
-        except Exception as e:
-            return {'status': 'error', 'message': f'Launch failed: {e}'}
+        error = _send_uplay_url(url)
+        if error:
+            return error
 
         if row['installed']:
             now_ts = int(time.time())
             update_game_data(appid, last_played=now_ts)
             return {'status': 'success', 'last_played': ts_to_date(now_ts)}
 
+        return {'status': 'success'}
+
+    def uninstall_game(self, appid):
+        from database import get_db
+
+        db  = get_db()
+        row = db.execute(
+            "SELECT platform_id FROM games WHERE appid = ?", (appid,)
+        ).fetchone()
+        db.close()
+
+        if not row:
+            return {'status': 'error', 'message': 'Ubisoft game not found'}
+
+        space_id = (row['platform_id'] or '').strip()
+        if not space_id:
+            return {'status': 'error', 'message': 'Game has no space ID — try re-syncing'}
+
+        from .watcher import resolve_launch_id
+        launch_id = resolve_launch_id(space_id) or space_id
+
+        error = _send_uplay_url(f'uplay://uninstall/{launch_id}')
+        if error:
+            return error
         return {'status': 'success'}
 
     def launcher_status(self):
@@ -206,7 +286,8 @@ class UbisoftPlugin:
             return {'status': 'error', 'message': 'Ubisoft Connect not found. Check Wine setup in Plugins settings.'}
         try:
             from runners.wine import run_in_prefix
-            run_in_prefix(prefix, exe_path, wine_bin=wine_bin, env_extra={'WINEDEBUG': '-all'})
+            run_in_prefix(prefix, exe_path, wine_bin=wine_bin, env_extra={'WINEDEBUG': '-all'},
+                          restart_session_if_running=True)
         except RuntimeError as e:
             return {'status': 'error', 'message': str(e)}
         except Exception as e:
@@ -216,10 +297,16 @@ class UbisoftPlugin:
     def js_api(self):
         native = sys.platform == 'win32'
         return {
-            'uninstall_url':     None,
+            'uninstall_url':     '/api/ubisoft/uninstall/{appid}',
+            'uninstall_confirm': 'Uninstall this game?\n\n'
+                                  'This tells Ubisoft Connect to uninstall it -- the actual removal '
+                                  'happens in the client, not immediately.',
             'scrape_url':        '/api/ubisoft/scrape-single/{appid}',
             'scrape_method':     'POST',
-            'store_url':         'https://www.ubisoft.com/en-us/game/{slug}',
+            # No locale prefix (goes to the user's own language automatically)
+            # and 'games' is plural -- confirmed against a real working link;
+            # the previous '/en-us/game/{slug}' (singular, locale-prefixed) 404s.
+            'store_url':         'https://www.ubisoft.com/games/{slug}',
             'store_label':       'View on Ubisoft Store ↗',
             'appid_label':       'Ubisoft Space ID:',
             'sync_label':        'Sync Ubisoft Library',
@@ -260,6 +347,13 @@ class UbisoftPlugin:
                 items.append({'type': 'button', 'label': 'Start Launcher', 'action': {
                     'type': 'call', 'fn': 'ubisoftStartLauncher',
                 }})
+                items.append({'type': 'text', 'content':
+                              'Once signed in to the real app, its own local game cache can be read directly '
+                              '-- no PlayDate account connection needed for this.'})
+                items.append({'type': 'button', 'label': 'Sync Library from Launcher', 'action': {
+                    'type': 'call', 'fn': 'ubisoftSyncLocal',
+                }})
+                items.append({'type': 'status_output', 'key': 'sync_local'})
             launcher_section = {'title': 'Launcher', 'items': items}
 
         return {
@@ -269,173 +363,27 @@ class UbisoftPlugin:
                     'auth': {
                         'endpoint': '/api/ubisoft/status',
                         'disconnected': [
+                            {'type': 'text', 'content':
+                                'Signing in is optional and rarely needed -- library sync, install, and '
+                                'launch all work without it, using the Ubisoft Connect app\'s own local data '
+                                '(see the Launcher section below). Ubisoft\'s automated login is blocked by '
+                                'their own bot detection and isn\'t offered here; connecting an account only '
+                                'helps with rare edge cases (e.g. a game whose name can\'t be resolved locally).'},
                             {'type': 'button', 'label': 'Connect Ubisoft Account', 'action': {
-                                'type': 'oauth_popup',
-                                'title': 'Connect Ubisoft Connect',
-                                'url_endpoint': '/api/ubisoft/auth-url',
-                                'callback_endpoint': '/api/ubisoft/connect',
-                                'redirect_pattern': 'ubisoft.com',
-                                'intercept_js': (
-                                    # Intercept XHR/fetch in the login popup to capture the session ticket.
-                                    # Matches any ubisoft/ubi.com response with a ticket field — needed
-                                    # because 2FA uses a different URL than the initial login endpoint.
-                                    "(function(){"
-                                    "var _KEY='_pd_ubi_sess';"
-                                    "function _store(text){"
-                                    "try{if(text)localStorage.setItem(_KEY,text);}catch(e){}"
-                                    "try{if(text)window.name=text;}catch(e){}"
-                                    # Cookie fallback: window.name may not survive cross-origin navigations.
-                                    "try{"
-                                    "if(text){"
-                                    "var o=JSON.parse(text);"
-                                    "if(o&&o.ticket){"
-                                    "document.cookie='_pd_ubi_tk='+encodeURIComponent(o.ticket.substring(0,3000))+'; path=/; SameSite=Lax';"
-                                    "document.cookie='_pd_ubi_rm='+encodeURIComponent((o.rememberMeTicket||'').substring(0,3000))+'; path=/; SameSite=Lax';"
-                                    "}"
-                                    "}"
-                                    "}catch(e){}"
-                                    "}"
-                                    "function _try(text,url){"
-                                    "var u=url||'';"
-                                    "if(u.indexOf('ubisoft')===-1&&u.indexOf('ubi.com')===-1)return;"
-                                    "try{var o=JSON.parse(text);if(o&&(o.ticket||o.rememberMeTicket))_store(text);}catch(e){}"
-                                    "}"
-                                    "var _oOpen=XMLHttpRequest.prototype.open,_oSend=XMLHttpRequest.prototype.send;"
-                                    "XMLHttpRequest.prototype.open=function(m,u){this._pdu=u||'';return _oOpen.apply(this,arguments);};"
-                                    "XMLHttpRequest.prototype.send=function(){"
-                                    "var x=this;"
-                                    "x.addEventListener('load',function(){"
-                                    "try{"
-                                    "if(x.status>=200&&x.status<300){"
-                                    # responseText throws if the caller set responseType to
-                                    # anything other than '' or 'text' (e.g. 'json') — common
-                                    # for API clients built on XHR. Read x.response instead
-                                    # in that case and stringify if it's not already text.
-                                    "var body=(x.responseType===''||x.responseType==='text')?x.responseText:x.response;"
-                                    "var text=(typeof body==='string')?body:JSON.stringify(body);"
-                                    "_try(text,x._pdu);"
-                                    "}"
-                                    "}catch(e){}"
-                                    "});"
-                                    "return _oSend.apply(this,arguments);"
-                                    "};"
-                                    "var _oFetch=window.fetch;"
-                                    "if(typeof _oFetch==='function'){"
-                                    "window.fetch=function(input,init){"
-                                    "var u=typeof input==='string'?input:(input&&input.url)||'';"
-                                    "var p=_oFetch.apply(this,arguments);"
-                                    "p.then(function(r){if(r&&r.ok)r.clone().text().then(function(t){_try(t,u);}).catch(function(){});}).catch(function(){});"
-                                    "return p;"
-                                    "};"
-                                    "}"
-                                    "})()"
-                                ),
-                                'code_js': (
-                                    "(function(){"
-                                    "try{"
-                                    # 1) URL fragment — Ubisoft may pass ticket in hash after form POST redirect.
-                                    "var h=window.location.hash.slice(1);"
-                                    "if(h){"
-                                    "var ps={};"
-                                    "h.split('&').forEach(function(p){"
-                                    "var kv=p.split('=');"
-                                    "if(kv.length>=2)ps[decodeURIComponent(kv[0])]=decodeURIComponent(kv.slice(1).join('='));"
-                                    "});"
-                                    "if(ps.ticket||ps.rememberMeTicket)return JSON.stringify(ps);"
-                                    "}"
-                                    # 2) window.name (set by intercept_js if login used XHR/fetch)
-                                    "var wn=window.name||'';"
-                                    "if(wn){try{var wo=JSON.parse(wn);if(wo&&(wo.ticket||wo.rememberMeTicket)){return wn;}}catch(e){}}"
-                                    # 3) localStorage/sessionStorage — deep search for ticket-like objects
-                                    "var stores=[localStorage,sessionStorage];"
-                                    "for(var s=0;s<stores.length;s++){"
-                                    "try{"
-                                    "for(var i=0;i<stores[s].length;i++){"
-                                    "var v=stores[s].getItem(stores[s].key(i));"
-                                    "try{"
-                                    "var o=JSON.parse(v);"
-                                    # Direct: {ticket, rememberMeTicket}
-                                    "if(o&&(o.ticket||o.rememberMeTicket))return v;"
-                                    # Nested one level: {loginData: {ticket, ...}} or similar
-                                    "if(o&&typeof o==='object'){"
-                                    "for(var nk in o){"
-                                    "var nv=o[nk];"
-                                    "if(nv&&typeof nv==='object'&&(nv.ticket||nv.rememberMeTicket))return JSON.stringify(nv);"
-                                    "}"
-                                    "}"
-                                    "}catch(e){}"
-                                    "}"
-                                    "}catch(e){}"
-                                    "}"
-                                    # 4) Cookie set by intercept_js if XHR/fetch was intercepted
-                                    "var tk='',rm='';"
-                                    "var ck=document.cookie.split(';');"
-                                    "for(var j=0;j<ck.length;j++){"
-                                    "var p=ck[j].trim();"
-                                    "if(p.indexOf('_pd_ubi_tk=')===0)tk=decodeURIComponent(p.slice(11));"
-                                    "if(p.indexOf('_pd_ubi_rm=')===0)rm=decodeURIComponent(p.slice(11));"
-                                    "}"
-                                    "if(tk)return JSON.stringify({ticket:tk,rememberMeTicket:rm||null});"
-                                    # 5) Diagnostic — no longer tied to a specific hardcoded
-                                    #    landing path (the old target, /ready, 404s as of
-                                    #    2026-08; Ubisoft's current default post-login page
-                                    #    isn't known in advance since nextUrl is now omitted).
-                                    #    Fires on anything that isn't the login form itself or
-                                    #    the third-party-error bounce page, so it still stays
-                                    #    open through login/2FA but reports on whatever page
-                                    #    Ubisoft actually lands on afterward.
-                                    #    Must check pathname, not the full href: the login page's
-                                    #    own URL used to embed 'change_domain' inside its nextUrl
-                                    #    query param, which matched immediately on page load.
-                                    "var href=window.location.href;"
-                                    "var _pn=window.location.pathname;"
-                                    "if(_pn.indexOf('/login')===-1&&_pn.indexOf('third-party-error')===-1&&_pn!=='/'){"
-                                    "var lsItems={};"
-                                    "try{"
-                                    "for(var li=0;li<localStorage.length;li++){"
-                                    "var lk=localStorage.key(li);"
-                                    "lsItems[lk]=(localStorage.getItem(lk)||'').substring(0,400);"
-                                    "}"
-                                    "}catch(e){}"
-                                    "var ssItems={};"
-                                    "try{"
-                                    "for(var si=0;si<sessionStorage.length;si++){"
-                                    "var sk=sessionStorage.key(si);"
-                                    "ssItems[sk]=(sessionStorage.getItem(sk)||'').substring(0,400);"
-                                    "}"
-                                    "}catch(e){}"
-                                    "return JSON.stringify({_pd_diag:1,href:href,ck:document.cookie,ls:lsItems,ss:ssItems});"
-                                    "}"
-                                    # Not on change_domain — stay open (login/2FA page)
-                                    "}catch(e){}"
-                                    "return '';"
-                                    "})()"
-                                ),
-                                'instructions': [
-                                    'Sign in to your Ubisoft account in the popup.',
-                                    'PlayDate will connect automatically once you are logged in.',
-                                    'If it does not connect automatically: in the popup, open DevTools (F12) '
-                                    '→ Application → Local Storage → connect.ubisoft.com, '
-                                    'find <code>loginData</code>, copy its value, and paste it below.',
-                                    'If the popup gets stuck on a verification/captcha page and never reaches '
-                                    'the real login form at all: sign in at '
-                                    '<a href="https://connect.ubisoft.com" target="_blank">connect.ubisoft.com</a> '
-                                    'in your regular browser instead, then open that browser\'s DevTools (F12) → '
-                                    'Application → Local Storage → connect.ubisoft.com, find <code>loginData</code>, '
-                                    'copy its value, and paste it below.',
-                                ],
-                                'input_placeholder': 'Paste loginData JSON value here…',
-                                'open_label': 'Open Ubisoft Sign In',
-                                'submit_label': 'Connect',
-                            }},
-                            {'type': 'button', 'label': 'Paste session data manually', 'variant': 'muted', 'action': {
                                 'type': 'oauth_paste',
                                 'title': 'Connect Ubisoft Connect',
                                 'url_endpoint': '/api/ubisoft/auth-url',
                                 'callback_endpoint': '/api/ubisoft/connect',
-                                'instructions': [],
-                                'input_placeholder': '',
-                                'open_label': '',
+                                'instructions': [
+                                    'Sign in to your Ubisoft account at '
+                                    '<a href="https://connect.ubisoft.com" target="_blank">connect.ubisoft.com</a> '
+                                    'in your regular desktop browser.',
+                                    'Open that browser\'s DevTools (F12) → Application → Local Storage → '
+                                    'connect.ubisoft.com, find <code>loginData</code>, copy its value, and '
+                                    'paste it below.',
+                                ],
+                                'input_placeholder': 'Paste loginData JSON value here…',
+                                'open_label': 'Open Ubisoft Sign In',
                                 'submit_label': 'Connect',
                             }},
                         ],

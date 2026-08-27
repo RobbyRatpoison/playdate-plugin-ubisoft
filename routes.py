@@ -53,6 +53,18 @@ def ubi_connect():
     return jsonify({'status': 'error', 'message': result}), 400
 
 
+@bp.route('/basic-login', methods=['POST'])
+def ubi_basic_login():
+    from .ubisoft import login_with_credentials
+    body = request.json or {}
+    username = (body.get('username') or '').strip()
+    password = body.get('password') or ''
+    ok, result = login_with_credentials(username, password)
+    if ok:
+        return jsonify({'status': 'success', 'username': result})
+    return jsonify({'status': 'error', 'message': result}), 400
+
+
 @bp.route('/disconnect', methods=['POST'])
 def ubi_disconnect():
     from .ubisoft import clear_ubi_tokens
@@ -73,6 +85,22 @@ def ubi_start_launcher():
 def ubi_sync():
     from .ubisoft import start_library_sync
     result = start_library_sync()
+    return jsonify(result)
+
+
+@bp.route('/uninstall/<int:appid>', methods=['POST'])
+def ubi_uninstall(appid):
+    import plugins
+    plugin = plugins.get('ubisoft')
+    if plugin is None:
+        return jsonify({'status': 'error', 'message': 'Plugin not loaded'}), 500
+    return jsonify(plugin.uninstall_game(appid))
+
+
+@bp.route('/sync-local', methods=['POST'])
+def ubi_sync_local():
+    from .ubisoft import start_local_library_sync
+    result = start_local_library_sync()
     return jsonify(result)
 
 

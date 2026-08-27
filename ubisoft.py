@@ -20,19 +20,29 @@ from images import save_as_jpg
 log = logging.getLogger(__name__)
 
 # ── Ubisoft API constants ─────────────────────────────────────────────────────
+# Used for API calls (Ubi-AppId header on sessions/products/etc requests) --
+# distinct from the login-specific identifiers below.
 UBI_APP_ID     = '82b650c0-6cb3-40c0-9f41-25a53b62b206'
 UBI_GENOME_ID  = '42d07c95-9914-4450-8b38-267c4e462b21'
-# nextUrl used to be connect.ubisoft.com/ready, which 404s as of 2026-08 --
-# Ubisoft evidently retired that landing page. Login itself validates nextUrl
-# before showing the form and bounces to third-party-error immediately if the
-# target isn't recognized, so a stale value breaks login outright, before the
-# user even gets a chance to enter credentials. Omitted entirely now so
-# Ubisoft redirects to whatever its own current default is instead of a
-# hardcoded guess -- code_js's landing-page detection was broadened to match,
-# since we no longer know the exact path in advance.
+
+# Login uses a *different* appId/genomeId pair than the one used for API
+# calls above -- confirmed against a real reference client (galaxy-integration-
+# uplay) that these are deliberately separate identifiers, not a typo. Our
+# previous login URL reused UBI_APP_ID/UBI_GENOME_ID here, which don't match
+# either of that reference's known-good pairs -- very likely why login was
+# bouncing straight to third-party-error before the form even loaded: login
+# validates the appId/genomeId pair up front and rejects anything it doesn't
+# recognize. nextUrl also restored (a prior fix had removed it entirely after
+# the old hardcoded '/ready' target started 404ing -- but Ubisoft's own login
+# validation treats *missing* nextUrl as invalid too, not just a stale one;
+# 'https://connect.ubisoft.com/' is the reference client's current value).
+_UBI_LOGIN_APP_ID    = '1068ef52-dfd2-4e62-8ac9-37a47e6c0b78'
+_UBI_LOGIN_GENOME_ID = '954e66a0-be1b-4aa0-9690-fb75201e4e9e'
+_UBI_LOGIN_NEXT_URL  = 'https://connect.ubisoft.com/'
 UBI_LOGIN_URL  = (
     'https://connect.ubisoft.com/login'
-    f'?appId={UBI_APP_ID}&genomeId={UBI_GENOME_ID}&lang=en-US'
+    f'?appId={_UBI_LOGIN_APP_ID}&genomeId={_UBI_LOGIN_GENOME_ID}&lang=en-US'
+    f'&nextUrl={requests.utils.quote(_UBI_LOGIN_NEXT_URL, safe="")}'
 )
 
 _SESSIONS_URL  = 'https://public-ubiservices.ubi.com/v3/profiles/sessions'
@@ -82,6 +92,28 @@ def get_auth_url():
     return UBI_LOGIN_URL
 
 
+def login_with_credentials(username, password):
+    """
+    Direct HTTP Basic Auth against Ubisoft's own sessions endpoint -- no
+    browser popup needed. Bypasses the fragile embedded-webview login flow
+    entirely (which was hitting a hard third-party-error bounce before the
+    form even loaded).
+    Returns (True, username) on success, (False, error_msg) on failure.
+    Not verified against a 2FA-enabled account -- if Ubisoft challenges for
+    a second factor, this will fail with whatever error the API returns;
+    the popup/paste options remain available as a fallback for that case.
+    """
+    import base64
+    if not username or not password:
+        return False, 'Username and password are required'
+    b64 = base64.b64encode(f'{username}:{password}'.encode('utf-8')).decode('ascii')
+    try:
+        data = _post_sessions(f'Basic {b64}')
+    except ValueError as e:
+        return False, f'Login failed: {e}'
+    return _store_session(data)
+
+
 def _post_sessions(auth_header, body=None):
     """
     POST to Ubisoft sessions endpoint. Returns raw response dict or raises ValueError.
@@ -95,33 +127,66 @@ def _post_sessions(auth_header, body=None):
     return resp.json()
 
 
+def _find_ticket_dict(obj, depth=3):
+    """
+    Recursively search a parsed JSON value for the first dict containing a
+    'ticket' key -- Ubisoft's own pages have been observed writing session
+    data under several different shapes/wrapper keys (a direct object, a
+    {"d": ..., "r": ...} localStorage envelope, and an {"opId", "payload":
+    {...}} IPC-style wrapper), and pinning to one exact shape breaks the
+    moment the page changes which key it uses. Dict values that are
+    themselves JSON-encoded strings are parsed and searched too, since the
+    {d, r} envelope's values are strings, not nested objects.
+    """
+    if depth <= 0:
+        return None
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except Exception:
+            return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get('ticket'):
+        return obj
+    for value in obj.values():
+        found = _find_ticket_dict(value, depth - 1)
+        if found:
+            return found
+    return None
+
+
 def exchange_code(raw_input):
     """
-    Accept session data from the popup's code_js.
-    Handles two formats:
-      1. Direct sessions API response: {"ticket": "...", "rememberMeTicket": "...", ...}
-      2. Legacy localStorage envelope: {"d": <loginData JSON>, "r": <rememberMe JSON>}
+    Accept session data pasted or captured from Ubisoft's login page.
+    The exact shape/wrapper key varies (see _find_ticket_dict); this just
+    needs *a* dict with a 'ticket' key somewhere in the parsed structure.
+    For the {d, r} envelope specifically, 'r' (rememberMe) is merged in
+    separately since it's a sibling object, not nested under the ticket dict.
     Returns (True, username) on success, (False, error_msg) on failure.
     """
     raw = (raw_input or '').strip()
     log.info(f'Ubisoft exchange_code: received {len(raw)} chars: {raw[:300]!r}')
     try:
         data = json.loads(raw)
-        if isinstance(data, dict):
-            # Direct sessions API response (from XHR code_js)
-            if data.get('ticket'):
-                return _store_session(data)
-            # Legacy localStorage envelope {d, r}
-            if 'd' in data or 'r' in data:
-                login_data  = json.loads(data.get('d') or '{}')
-                remember_me = json.loads(data.get('r') or '{}')
-                combined    = {**login_data, **remember_me}
-                if combined.get('ticket'):
-                    return _store_session(combined)
-                return False, 'localStorage data missing ticket — try logging in again'
     except Exception as e:
         log.warning(f'Ubisoft exchange_code: failed to parse session data: {e}')
-    return False, 'Could not parse session data from Ubisoft login'
+        return False, 'Could not parse session data from Ubisoft login'
+
+    found = _find_ticket_dict(data)
+    if not found:
+        log.warning(f'Ubisoft exchange_code: no ticket found in parsed data (keys: '
+                    f'{list(data.keys()) if isinstance(data, dict) else type(data)})')
+        return False, 'localStorage data missing ticket — try logging in again'
+
+    if isinstance(data, dict) and ('d' in data or 'r' in data) and 'r' in data:
+        try:
+            remember_me = json.loads(data.get('r') or '{}')
+            found = {**found, **{k: v for k, v in remember_me.items() if k not in found}}
+        except Exception:
+            pass
+
+    return _store_session(found)
 
 
 def _store_session(data):
@@ -383,6 +448,188 @@ def _do_sync_library():
         })
 
 
+# ── Local (no-auth) library sync ────────────────────────────────────────────
+# Reads Ubisoft Connect's own local game-catalog cache directly (see
+# config_parser.py) -- works entirely from the installed, logged-in native
+# launcher, with no PlayDate-side account login required at all. Uses the
+# same _sync_state/_sync_lock/_sync_cancel as the API-based sync above since
+# only one can usefully run at a time and the UI has one status area.
+
+# Public, unauthenticated Ubisoft CDN pattern for the small thumbnail image
+# embedded in the local cache (confirmed live: matches Lutris's own
+# UbisoftCover.url_pattern, a plain string-substitution URL with no auth).
+_THUMB_CDN_URL = 'https://static3.cdn.ubi.com/orbit/uplay_launcher_3_0/assets/%s'
+
+
+def start_local_library_sync():
+    with _sync_lock:
+        if _sync_state['running']:
+            return {'status': 'already_running'}
+        _sync_cancel.clear()
+        _sync_state.update({
+            'running': True, 'phase': 'fetching_library', 'done': 0, 'total': 0,
+            'current_game': '', 'new_games': 0, 'total_games': 0,
+            'duplicates_detected': 0, 'error': None,
+        })
+    threading.Thread(target=_run_local_sync_library, daemon=True).start()
+    return {'status': 'started'}
+
+
+def _run_local_sync_library():
+    try:
+        _do_local_sync_library()
+    except Exception as e:
+        log.error(f'Ubisoft local library sync thread: {e}', exc_info=True)
+        with _sync_lock:
+            _sync_state.update({'running': False, 'phase': 'error', 'error': str(e)})
+
+
+def _do_local_sync_library():
+    from database import get_db, update_game_data as _update_game_data
+    from datetime import datetime, timezone, date as _date
+    from .watcher import _get_configurations_path
+    from .config_parser import read_configurations
+
+    config_path = _get_configurations_path()
+    if not config_path or not os.path.isfile(config_path):
+        with _sync_lock:
+            _sync_state.update({'running': False, 'phase': 'error',
+                                'error': 'Ubisoft Connect launcher not installed, or never signed in'})
+        return
+
+    from .config_parser import is_placeholder_name, slugify
+
+    # Some legacy titles (pre-dating Ubisoft's spaceId/Connect API system --
+    # e.g. Rayman Origins, older Rainbow Six/Splinter Cell/Ghost Recon/Prince
+    # of Persia entries) have no space_id in the local cache at all, only the
+    # classic numeric install_id/launch_id. Requiring space_id here silently
+    # dropped all of them from the sync entirely. They have no API presence
+    # (no metadata/art beyond the local thumb, can't be enriched below), but
+    # the numeric id is exactly what uplay://launch/ needs, so they're worth
+    # importing with that id standing in for platform_id.
+    # Entries cross-linked to another storefront (Steam, and presumably Epic
+    # etc -- see config_parser._parse_entry) aren't real Ubisoft installs;
+    # Ubisoft Connect can't actually install/launch them itself (it tries to
+    # hand off to the linked store's own client, which doesn't exist inside
+    # this Wine prefix, so the Install button silently does nothing) and
+    # they duplicate a library entry the user already owns elsewhere.
+    entries = [e for e in read_configurations(config_path)
+               if e['name'] and (e['space_id'] or e['launch_id'])
+               and not e['third_party_platform']]
+    log.info(f'Ubisoft local sync: {len(entries)} usable entries in local cache')
+
+    # Ubisoft's own local cache occasionally has a broken placeholder name
+    # ('l1', 'GAMENAME') with no usable fallback in the YAML itself --
+    # confirmed live for two real owned games (Rainbow Six Siege, Trials
+    # Fusion). If we're authenticated, the products API has the real name;
+    # opportunistic and best-effort, never blocks the sync if it's not.
+    # Only applies to entries with a real space_id -- there's no API record
+    # to query for the legacy space_id-less ones above.
+    session = get_valid_session()
+    if session:
+        for entry in entries:
+            if entry['space_id'] and is_placeholder_name(entry['name']):
+                meta = _fetch_product_metadata(session, entry['space_id'])
+                if meta and meta.get('name'):
+                    log.info(f"Ubisoft local sync: enriched name for {entry['space_id']}: "
+                             f"{entry['name']!r} -> {meta['name']!r}")
+                    entry['name'] = meta['name']
+
+    db = get_db()
+    try:
+        existing = {row['platform_id'] for row in db.execute(
+            "SELECT platform_id FROM games WHERE platform = 'ubisoft'"
+        ).fetchall()}
+        blacklisted = {row[0] for row in db.execute(
+            "SELECT platform_id FROM blacklist WHERE platform_id IS NOT NULL"
+        ).fetchall()}
+    finally:
+        db.close()
+
+    new_entries = [e for e in entries
+                   if (e['space_id'] or e['launch_id']) not in existing
+                   and (e['space_id'] or e['launch_id']) not in blacklisted]
+    total_new = len(new_entries)
+    log.info(f'Ubisoft local sync: {total_new} new games (skipped {len(entries) - total_new} existing)')
+
+    with _sync_lock:
+        _sync_state.update({'phase': 'processing', 'done': 0, 'total': total_new})
+
+    today_ts        = int(datetime.now(timezone.utc).timestamp())
+    today           = _date.today().isoformat()
+    new_games_count = 0
+
+    db = get_db()
+    try:
+        for entry in new_entries:
+            if _sync_cancel.is_set():
+                with _sync_lock:
+                    _sync_state.update({'running': False, 'phase': 'stopped',
+                                        'new_games': new_games_count, 'total_games': len(entries)})
+                return
+
+            platform_id = entry['space_id'] or entry['launch_id']
+            name        = entry['name']
+            slug        = slugify(name)
+
+            with _sync_lock:
+                _sync_state['current_game'] = name
+
+            next_appid = next_negative_appid(db)
+            db.execute(
+                """INSERT OR IGNORE INTO games
+                   (appid, name, platform, platform_id, platform_slug, date_added,
+                    completion_status, installed,
+                    art_fetched, meta_fetched, cheevos_fetched,
+                    protondb_fetched, hltb_fetched)
+                   VALUES (?, ?, 'ubisoft', ?, ?, ?,
+                           'Never Played', 0,
+                           '0', '0', '0', '0', '0')""",
+                (next_appid, name, platform_id, slug, today_ts),
+            )
+            db.commit()
+            log.info(f'Ubisoft local sync: added {name!r} as appid {next_appid} '
+                     f'({"spaceId" if entry["space_id"] else "legacy launch_id"} {platform_id})')
+
+            try:
+                thumb_url = _THUMB_CDN_URL % entry['thumb_image'] if entry['thumb_image'] else None
+                art_ok = _download_art(None, next_appid, entry['space_id'], name=name,
+                                        images=([{'type': 'portrait', 'url': thumb_url}] if thumb_url else []))
+                if art_ok:
+                    _update_game_data(next_appid, art_fetched=today)
+            except Exception as e:
+                log.warning(f'Ubisoft local sync art: failed for {name!r}: {e}')
+
+            new_games_count += 1
+            with _sync_lock:
+                _sync_state['done'] += 1
+
+            if _sync_cancel.is_set():
+                with _sync_lock:
+                    _sync_state.update({'running': False, 'phase': 'stopped',
+                                        'new_games': new_games_count, 'total_games': len(entries)})
+                return
+    finally:
+        db.close()
+
+    try:
+        from .watcher import sync_ubisoft_install_status
+        sync_ubisoft_install_status()
+    except Exception as e:
+        log.warning(f'Ubisoft local sync: install status refresh failed: {e}')
+
+    from database import auto_detect_duplicates
+    from plugins import get_platform_priority
+    dupes = auto_detect_duplicates(platform_priority=get_platform_priority())
+
+    with _sync_lock:
+        _sync_state.update({
+            'running': False, 'phase': 'done',
+            'new_games': new_games_count, 'total_games': len(entries),
+            'duplicates_detected': dupes,
+        })
+
+
 # ── Metadata ──────────────────────────────────────────────────────────────────
 
 def _fetch_product_metadata(session, space_id):
@@ -530,11 +777,15 @@ def scrape_single(appid):
     """
     Re-fetch metadata and art for one Ubisoft game.
     Returns a dict of updated fields, or None on failure.
-    """
-    session = get_valid_session()
-    if not session:
-        return None
 
+    Prefers the authenticated products API (full metadata) when a valid
+    session exists; falls back to the client's own local cache (name +
+    thumbnail art only, via config_parser) otherwise, so the per-game Sync
+    button and bulk rescrape both still do *something* useful without a
+    successful Ubisoft login -- which is presently blocked by DataDome bot
+    detection on the popup login flow (see project_ubisoft_datadome_blocked
+    memory). Returns None only if neither source has anything for this game.
+    """
     from database import get_db
     db  = get_db()
     row = db.execute(
@@ -546,11 +797,30 @@ def scrape_single(appid):
     if not row or not row['platform_id']:
         return None
 
-    space_id = row['platform_id']
+    space_id  = row['platform_id']
     game_name = row['name'] or ''
-    meta = _fetch_product_metadata(session, space_id) or {}
-    images = meta.pop('_images', None)
-    name = meta.get('name') or game_name
+
+    session = get_valid_session()
+    if session:
+        meta   = _fetch_product_metadata(session, space_id) or {}
+        images = meta.pop('_images', None)
+        name   = meta.get('name') or game_name
+    else:
+        from .config_parser import is_placeholder_name
+        from .watcher import find_local_entry
+        meta   = {}
+        images = None
+        name   = game_name
+        entry  = find_local_entry(space_id)
+        if not entry:
+            return None
+        if entry['name'] and not is_placeholder_name(entry['name']):
+            name = entry['name']
+            meta['name'] = name
+        if entry['thumb_image']:
+            images = [{'type': 'portrait', 'url': _THUMB_CDN_URL % entry['thumb_image']}]
+        if not meta and not images:
+            return None
 
     from datetime import date
     meta['meta_fetched'] = date.today().isoformat()
