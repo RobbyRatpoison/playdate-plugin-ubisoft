@@ -8,18 +8,25 @@ log = logging.getLogger(__name__)
 
 def _find_native_launcher():
     """Return path to UbisoftConnect.exe on Windows, or None."""
-    if sys.platform == 'win32':
-        candidates = []
-        for env in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432'):
-            base = os.environ.get(env, '')
-            if base:
-                candidates.append(os.path.join(
-                    base, 'Ubisoft', 'Ubisoft Game Launcher', 'UbisoftConnect.exe'))
-                candidates.append(os.path.join(
-                    base, 'Ubisoft Game Launcher', 'UbisoftConnect.exe'))
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
+    if sys.platform != 'win32':
+        return None
+    from runners.windows import find_installed_exe
+    exe = find_installed_exe('Ubisoft Connect', 'UbisoftConnect.exe')
+    if exe:
+        return exe
+    # Fallback: standard install-path guesses, in case the registry
+    # DisplayName doesn't match (older installs may still say 'Uplay').
+    candidates = []
+    for env in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432'):
+        base = os.environ.get(env, '')
+        if base:
+            candidates.append(os.path.join(
+                base, 'Ubisoft', 'Ubisoft Game Launcher', 'UbisoftConnect.exe'))
+            candidates.append(os.path.join(
+                base, 'Ubisoft Game Launcher', 'UbisoftConnect.exe'))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
     return None
 
 
@@ -347,6 +354,10 @@ class UbisoftPlugin:
                 items.append({'type': 'button', 'label': 'Start Launcher', 'action': {
                     'type': 'call', 'fn': 'ubisoftStartLauncher',
                 }})
+                items.append({'type': 'button', 'label': 'Open Folder', 'action': {
+                    'type': 'call', 'fn': 'ubisoftOpenFolder',
+                }})
+                items.append({'type': 'status_output', 'key': 'folder'})
                 items.append({'type': 'text', 'content':
                               'Once signed in to the real app, its own local game cache can be read directly '
                               '-- no PlayDate account connection needed for this.'})

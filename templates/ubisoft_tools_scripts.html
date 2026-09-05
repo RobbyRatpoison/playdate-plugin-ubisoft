@@ -43,6 +43,17 @@ async function ubisoftStartLauncher() {
     }
 }
 
+async function ubisoftOpenFolder() {
+    const st = document.getElementById('ubisoft-manage-status-folder');
+    try {
+        const r = await fetch('/api/ubisoft/open-folder', { method: 'POST' });
+        const d = await r.json();
+        if (d.status !== 'ok' && st) st.textContent = d.message || 'Failed to open folder';
+    } catch (e) {
+        if (st) st.textContent = 'Network error';
+    }
+}
+
 async function ubisoftSyncLocal() {
     const st = document.getElementById('ubisoft-manage-status-sync_local');
     if (!st) return;

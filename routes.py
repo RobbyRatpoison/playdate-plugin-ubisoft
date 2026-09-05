@@ -72,6 +72,19 @@ def ubi_disconnect():
     return jsonify({'status': 'success'})
 
 
+@bp.route('/open-folder', methods=['POST'])
+def ubi_open_folder():
+    import os
+    from . import _find_wine_launcher_config
+    from .watcher import _UBI_GAMES_SUBPATH
+    from runners.installdir import open_folder
+    prefix, _wine_bin, _exe = _find_wine_launcher_config()
+    if not prefix:
+        return jsonify({'status': 'error', 'message': 'No Wine prefix configured'}), 400
+    open_folder(os.path.join(prefix, _UBI_GAMES_SUBPATH))
+    return jsonify({'status': 'ok'})
+
+
 @bp.route('/start-launcher', methods=['POST'])
 def ubi_start_launcher():
     import plugins
