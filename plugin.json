@@ -1,7 +1,7 @@
 {
     "id": "ubisoft",
     "name": "Ubisoft Connect",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "min_core_version": "1.8.2",
     "platform": "ubisoft",
     "author": "RobbyRatpoison",
@@ -22,7 +22,8 @@
                     "content": "overlay:\n  enabled: false\n  forceunhookgame: false\n  fps_enabled: false\n  warning_enabled: false\nuser:\n  closebehavior: CloseBehavior_Close"
                 }
             ],
-            "install_path": "Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher"
+            "install_path": "Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher",
+            "detached_launcher": true
         }
     },
     "platform_status": {
