@@ -86,27 +86,33 @@ def _get_wine_install_base():
 def sync_ubisoft_install_status():
     """Update installed flags for all Ubisoft games by checking whether
     each one's registry_key (from the local configurations cache) resolves
-    to a real install directory in the Wine prefix."""
+    to a real install directory in the Wine prefix.
+
+    A missing prefix / configurations cache means nothing on this platform
+    can be installed, so we fall through with an empty set and still clear
+    stale installed=1 rows (e.g. the prefix was deleted after a game was
+    installed -- otherwise the badge and Open Folder disagree forever, since
+    nothing else downgrades the flag)."""
     from database import get_db
     from .config_parser import read_configurations, resolve_install_dir, invalidate_registry_cache
 
     prefix = _get_wine_prefix()
     config_path = _get_configurations_path()
-    if not prefix or not config_path or not os.path.isfile(config_path):
-        return
-
-    invalidate_registry_cache(prefix)
-    entries = read_configurations(config_path)
-    # Keyed by space_id when the entry has one, else its launch_id -- matches
-    # how platform_id is stored for legacy space_id-less games (see
-    # ubisoft._do_local_sync_library). Without this fallback, those games
-    # could never be detected as installed and would always get the
-    # `install` deep link instead of `launch`, even once actually installed.
-    installed_ids = {
-        (e['space_id'] or e['launch_id']) for e in entries
-        if (e['space_id'] or e['launch_id']) and e['registry_key']
-        and resolve_install_dir(prefix, e['registry_key'])
-    }
+    if prefix and config_path and os.path.isfile(config_path):
+        invalidate_registry_cache(prefix)
+        entries = read_configurations(config_path)
+        # Keyed by space_id when the entry has one, else its launch_id -- matches
+        # how platform_id is stored for legacy space_id-less games (see
+        # ubisoft._do_local_sync_library). Without this fallback, those games
+        # could never be detected as installed and would always get the
+        # `install` deep link instead of `launch`, even once actually installed.
+        installed_ids = {
+            (e['space_id'] or e['launch_id']) for e in entries
+            if (e['space_id'] or e['launch_id']) and e['registry_key']
+            and resolve_install_dir(prefix, e['registry_key'])
+        }
+    else:
+        installed_ids = set()
 
     db = get_db()
     try:
