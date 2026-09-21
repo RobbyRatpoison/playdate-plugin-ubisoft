@@ -704,6 +704,54 @@ def _fetch_product_metadata(session, space_id):
         return None
 
 
+def _classify_images(images):
+    """(vertical_url, horizontal_url) picked from a Ubisoft catalog image list."""
+    vertical_url   = None
+    horizontal_url = None
+    for img in images:
+        img_type = (img.get('type') or img.get('format') or '').lower()
+        url      = img.get('url') or img.get('uri') or ''
+        if not url:
+            continue
+        if any(k in img_type for k in ('portrait', 'vertical', 'packshot', 'cover', 'keyart_portrait')):
+            vertical_url = vertical_url or url
+        if any(k in img_type for k in ('landscape', 'horizontal', 'header', 'banner', 'background')):
+            horizontal_url = horizontal_url or url
+    return vertical_url, horizontal_url
+
+
+def art_urls(appid):
+    """Ubisoft's own art for core's Artwork Sources "Store" option:
+    {'vertical': url, 'horizontal': url}, any subset. Uses the authenticated
+    product catalog when logged in, else the local client cache's thumbnail on
+    Ubisoft's public CDN (login is blocked by DataDome for some users)."""
+    from database import get_db
+    db  = get_db()
+    row = db.execute(
+        "SELECT platform_id FROM games WHERE appid = ? AND platform = 'ubisoft'", (appid,)
+    ).fetchone()
+    db.close()
+    if not row or not row['platform_id']:
+        return {}
+    space_id = row['platform_id']
+    images = None
+    session = get_valid_session()
+    if session:
+        images = (_fetch_product_metadata(session, space_id) or {}).get('_images')
+    if not images:
+        from .watcher import find_local_entry
+        entry = find_local_entry(space_id)
+        if entry and entry['thumb_image']:
+            images = [{'type': 'portrait', 'url': _THUMB_CDN_URL % entry['thumb_image']}]
+    vertical_url, horizontal_url = _classify_images(images or [])
+    urls = {}
+    if vertical_url:
+        urls['vertical'] = vertical_url
+    if horizontal_url:
+        urls['horizontal'] = horizontal_url
+    return urls
+
+
 def _download_art(session, appid, space_id, name='', images=None):
     """
     Download cover art for a Ubisoft game.
@@ -735,17 +783,7 @@ def _download_art(session, appid, space_id, name='', images=None):
             log.warning(f'Ubisoft: failed to fetch product images for {space_id}: {e}')
         images = images or []
 
-    vertical_url   = None
-    horizontal_url = None
-    for img in images:
-        img_type = (img.get('type') or img.get('format') or '').lower()
-        url      = img.get('url') or img.get('uri') or ''
-        if not url:
-            continue
-        if any(k in img_type for k in ('portrait', 'vertical', 'packshot', 'cover', 'keyart_portrait')):
-            vertical_url = vertical_url or url
-        if any(k in img_type for k in ('landscape', 'horizontal', 'header', 'banner', 'background')):
-            horizontal_url = horizontal_url or url
+    vertical_url, horizontal_url = _classify_images(images)
 
     for url, dest in [(vertical_url, vert_path), (horizontal_url, horiz_path)]:
         if url and not os.path.exists(dest):

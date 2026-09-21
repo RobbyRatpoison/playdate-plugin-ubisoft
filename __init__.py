@@ -421,6 +421,12 @@ class UbisoftPlugin:
         from .ubisoft import scrape_single
         return scrape_single(appid) or None
 
+    art_kinds = ('vertical', 'horizontal')   # no icon art in the catalog
+
+    def art_urls(self, appid):
+        from .ubisoft import art_urls
+        return art_urls(appid)
+
     def fragments(self):
         return {
             'base_head_styles': 'ubisoft_base_head_styles.html',

@@ -1,7 +1,7 @@
 {
     "id": "ubisoft",
     "name": "Ubisoft Connect",
-    "version": "1.2.2",
+    "version": "1.3.0",
     "min_core_version": "1.8.2",
     "platform": "ubisoft",
     "author": "RobbyRatpoison",
