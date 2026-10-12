@@ -137,8 +137,6 @@ class UbisoftPlugin:
     platform = 'ubisoft'
     label    = 'Ubisoft Connect'
 
-    date_import_url = 'https://www.ubisoft.com/en-us/account/orders'
-
     def register(self, app):
         from .routes import bp
         app.register_blueprint(bp)
