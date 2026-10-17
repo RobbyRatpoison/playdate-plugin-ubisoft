@@ -137,6 +137,24 @@ class UbisoftPlugin:
     platform = 'ubisoft'
     label    = 'Ubisoft Connect'
 
+    def sync(self):
+        from .ubisoft import is_connected, start_library_sync, start_local_library_sync
+        return start_library_sync() if is_connected() else start_local_library_sync()
+
+    def sync_status(self):
+        """Outcome of the last library sync, for core's startup sync (see PLUGINS.md)."""
+        from .ubisoft import get_sync_state, is_connected
+        st = get_sync_state()
+        return {'running': bool(st.get('running')), 'error': st.get('error'),
+                'connected': bool(is_connected() or self._local_config_exists())}
+
+    @staticmethod
+    def _local_config_exists():
+        import os
+        from .watcher import _get_configurations_path
+        path = _get_configurations_path()
+        return bool(path and os.path.isfile(path))
+
     def register(self, app):
         from .routes import bp
         app.register_blueprint(bp)

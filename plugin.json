@@ -1,10 +1,10 @@
 {
     "id": "ubisoft",
     "name": "Ubisoft Connect",
-    "version": "2026.10.1",
+    "version": "2026.10.2",
     "release_note": {
-        "version": "2026.10.1",
-        "text": "The bulk date import no longer opens a Ubisoft page that does not exist."
+        "version": "2026.10.2",
+        "text": "New option on the plugin's card: sync your library when PlayDate starts."
     },
     "min_core_version": "1.8.2",
     "platform": "ubisoft",
@@ -19,7 +19,10 @@
             "type": "exe",
             "winearch": "win64",
             "win_version": "win10",
-            "winetricks": ["d3dcompiler_43", "corefonts"],
+            "winetricks": [
+                "d3dcompiler_43",
+                "corefonts"
+            ],
             "post_install_files": [
                 {
                     "path": "AppData\\Local\\Ubisoft Game Launcher\\settings.yaml",
